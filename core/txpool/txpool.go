@@ -87,6 +87,12 @@ var (
 	// than some meaningful limit a user might use. This is not a consensus error
 	// making the transaction invalid, rather a DOS protection.
 	ErrOversizedData = errors.New("oversized data")
+
+	//ED1, Discard Future tx when txpool is full
+	ErrRejFuture = errors.New("ED1, txpool is full, discard future tx")
+	//ED2
+	ErrRejOverdraftWhenEvictOtherTx = errors.New("ED2, txpool is full, discard this tx because it will evict other vaild tx(s) and it will cause overdraft")
+
 )
 
 var (
@@ -671,15 +677,45 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err e
 	// Make the local flag. If it's from local source or it's from the network but
 	// the sender is marked as local previously, treat it as the local transaction.
 	isLocal := local || pool.locals.containsTx(tx)
-
 	// If the transaction fails basic validation, discard it
 	if err := pool.validateTx(tx, isLocal); err != nil {
 		log.Trace("Discarding invalid transaction", "hash", hash, "err", err)
 		invalidTxMeter.Mark(1)
 		return false, err
 	}
+
+	from, _ := types.Sender(pool.signer, tx) // already validated
+	// D1
+	list := pool.pending[from]
+
+	//ED2
+	var isOverDraft = false
+
+	if list != nil { // Sender already has pending txs
+		sum := big.NewInt(0)
+		for _, pendingTx := range list.Flatten() {
+			curVal := pendingTx.Value()
+			curGas := big.NewInt(int64(pendingTx.Gas()))
+			curGasFee := big.NewInt(1).Mul(pendingTx.GasPrice(), curGas)
+			curSum := big.NewInt(0)
+			curSum.Add(curVal, curGasFee)
+			sum.Add(sum, curSum)
+		}
+		txVal := tx.Value()
+		txGas := big.NewInt(int64(tx.Gas()))
+		txGasFee := big.NewInt(1).Mul(tx.GasPrice(), txGas)
+		txSum := big.NewInt(0)
+		txSum.Add(txVal, txGasFee)
+		sum.Add(sum, txSum)
+		if sum.Cmp(pool.currentState.GetBalance(from)) > 0 {
+			//return false, ErrRejOverdraftWhenEvictOtherTx
+			isOverDraft = true
+		}
+	}
+
 	// If the transaction pool is full, discard underpriced transactions
 	if uint64(pool.all.Slots()+numSlots(tx)) > pool.config.GlobalSlots+pool.config.GlobalQueue {
+
 		// If the new transaction is underpriced, don't accept it
 		if !isLocal && pool.priced.Underpriced(tx) {
 			log.Trace("Discarding underpriced transaction", "hash", hash, "gasTipCap", tx.GasTipCap(), "gasFeeCap", tx.GasFeeCap())
@@ -706,6 +742,23 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err e
 			overflowedTxMeter.Mark(1)
 			return false, ErrTxPoolOverflow
 		}
+
+		var isFuture = false
+		isFuture = pool.isFuture(from, tx)
+		//ED2
+		if drop.Len() > 0 && isOverDraft && isFuture == false {
+			return false, ErrRejOverdraftWhenEvictOtherTx
+		}
+		for _, dropTx := range drop {
+			dropFrom, _ := types.Sender(pool.signer, dropTx)
+			//ED1
+			_, future_number := pool.stats()
+			if pool.pendingNonces.get(dropFrom) > dropTx.Nonce() && isFuture == true && future_number >= int(pool.config.GlobalQueue) {
+				return false, ErrRejFuture
+			}
+
+		}
+
 		// Bump the counter of rejections-since-reorg
 		pool.changesSinceReorg += len(drop)
 		// Kick out the underpriced remote transactions.
@@ -716,7 +769,7 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err e
 		}
 	}
 	// Try to replace an existing transaction in the pending pool
-	from, _ := types.Sender(pool.signer, tx) // already validated
+	//	from, _ := types.Sender(pool.signer, tx) // already validated
 	if list := pool.pending[from]; list != nil && list.Overlaps(tx) {
 		// Nonce already pending, check if required price bump is met
 		inserted, old := list.Add(tx, pool.config.PriceBump)
@@ -760,6 +813,13 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err e
 	return replaced, nil
 }
 
+func (pool *TxPool) isFuture(from common.Address, tx *types.Transaction) bool {
+
+	if pool.pendingNonces.get(from) >= tx.Nonce() {
+		return false
+	}
+	return true
+}
 // enqueueTx inserts a new transaction into the non-executable transaction queue.
 //
 // Note, this method assumes the pool lock is held!
